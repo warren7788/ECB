@@ -322,11 +322,28 @@
             );
         };
 			// ================= 交辦幹部事項區塊 (智慧鎖定身分 + Modal警告版) =================
-			const CadreTaskSection = ({ isTeacherMode, db }) => {
+			const CadreTaskSection = ({ isTeacherMode, db, tasks = [] }) => {
 				// 預設幹部清單
 				const CADRE_ROLES = ["班長", "副班長", "總務", "學藝", "衛生"];
 
-				const [tasks, setTasks] = useState([]);
+				const renderContentWithLinks = (text) => {
+					if (!text) return null;
+					const urlRegex = /(https?:\/\/[^\s]+)/g;
+					const parts = text.split(urlRegex);
+					return parts.map((part, index) => {
+						if (part.match(urlRegex)) {
+							return (
+								<a key={index} href={part} target="_blank" rel="noopener noreferrer" 
+								   className="text-blue-500 hover:text-blue-700 underline break-all"
+								   onClick={(e) => e.stopPropagation()}>
+									{part}
+								</a>
+							);
+						}
+						return part;
+					});
+				};
+				
 				const [isModalOpen, setIsModalOpen] = useState(false);
 				const [currentTask, setCurrentTask] = useState(null);
 				
@@ -350,15 +367,6 @@
 				
 				const [expandedTaskIds, setExpandedTaskIds] = useState(new Set());
 
-				useEffect(() => {
-					if (!db) return;
-					const unsubscribe = db.collection('cadre_tasks').orderBy('createdAt', 'desc')
-						.onSnapshot(snapshot => {
-							const newTasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-							setTasks(newTasks);
-						});
-					return () => unsubscribe();
-				}, [db]);
 
 				const getTodayStr = () => new Date().toISOString().split('T')[0];
 
@@ -515,7 +523,7 @@
 									</span>
 									<span className="text-[10px] text-slate-400">{formatFullTime(r.timestamp)}</span>
 								</div>
-								<div className={`text-xs leading-snug ${isTeacherReport ? 'text-blue-800' : 'text-slate-600'}`}>{r.content}</div>
+								<div className={`text-xs leading-snug ${isTeacherReport ? 'text-blue-800' : 'text-slate-600'} whitespace-pre-wrap`}>{renderContentWithLinks(r.content)}</div>
 							</div>
 						);
 					});
@@ -811,6 +819,7 @@
 				};
             const [viewMode, setViewMode] = useState('planner'); // 'planner' | 'bulletin' | 'resources'
             const [entries, setEntries] = useState([]);
+			const [cadreTasks, setCadreTasks] = React.useState([]);
 			// 1. 新增：偵測是否有進行中的幹部任務
 			const [hasActiveCadreTasks, setHasActiveCadreTasks] = useState(false);
 
@@ -825,6 +834,39 @@
 				return () => unsubscribe();
 			}, [db]);
 
+			// 新增：在 ClassPlanner 裡監聽交辦任務資料
+			useEffect(() => {
+				if (!db) return;
+				// 這裡的邏輯跟原本 CadreTaskSection 裡的一模一樣
+				const unsubscribe = db.collection('cadre_tasks').orderBy('createdAt', 'desc')
+					.onSnapshot(snapshot => {
+						const newTasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+						setCadreTasks(newTasks);
+					});
+				return () => unsubscribe();
+			}, []);
+
+
+			const handleFullExport = () => {
+				// 準備要打包的所有資料
+				const allData = {
+					entries: entries,           // 聯絡簿
+					announcements: announcements, // 公告
+					resources: resources,       // 資源連結
+					tasks: cadreTasks           // ★ 確保有這行，這是交辦事項
+				};
+
+				// 轉成 JSON 字串
+				const dataStr = JSON.stringify(allData);
+				const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+				
+				// 自動下載
+				const exportFileDefaultName = `聯絡簿備份_${new Date().toISOString().split('T')[0]}.json`;
+				const linkElement = document.createElement('a');
+				linkElement.setAttribute('href', dataUri);
+				linkElement.setAttribute('download', exportFileDefaultName);
+				linkElement.click();
+			};
 
 			// 管理已完成的事項 ID
             const [completedIds, setCompletedIds] = useState(() => {
@@ -888,7 +930,10 @@
             const [generalAlert, setGeneralAlert] = useState({ isOpen: false, title: '', message: '' });
             const [isRemoveDupConfirmOpen, setIsRemoveDupConfirmOpen] = useState(false);
 
-            const [passwordInput, setPasswordInput] = useState('');
+            const [isAlertModalOpen, setIsAlertModalOpen] = useState(false);
+			const [alertModalMessage, setAlertModalMessage] = useState("");
+			
+			const [passwordInput, setPasswordInput] = useState('');
             const [passwordError, setPasswordError] = useState(false);
             const [groupToDelete, setGroupToDelete] = useState(null); 
             const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -1254,11 +1299,61 @@
                 setIsImportPreviousConfirmOpen(true);
             };
             const confirmImportPrevious = () => {
-                if(importPreviousData) {
-                    const newItems = importPreviousData.items.map(e => ({ date: selectedDate, subject: e.subject, type: e.type, content: e.content, deadline: e.deadline, repeat: e.repeat }));
-                    saveToCloud('batch_add', newItems, 'entries'); setIsImportPreviousConfirmOpen(false); setImportPreviousData(null);
-                }
-            };
+				if (importPreviousData) {
+					// 1. 取得目前目標日期 (今天) 已有的資料，用來比對重複
+					const currentTargetEntries = entries.filter(e => e.date === selectedDate);
+
+					// 2. 篩選出真正需要匯入的資料
+					const validItems = importPreviousData.items.filter(e => {
+						// --- A. 過期檢查 ---
+						// 如果事項有截止日，而且「今天」已經超過「截止日」，就過濾掉 (不匯入)
+						// 字串比較: "2024-02-05" > "2024-02-04" 會是 true
+						if (e.deadline && selectedDate > e.deadline) {
+							return false;
+						}
+
+						// --- B. 重複檢查 (防止按兩次) ---
+						// 檢查今天是不是已經有一樣的科目和內容
+						const isDuplicate = currentTargetEntries.some(existing => 
+							existing.subject === e.subject && 
+							existing.content === e.content
+						);
+						
+						if (isDuplicate) {
+							return false; // 已經有了，跳過
+						}
+
+						return true; // 通過檢查，這個要！
+					});
+
+					// 3. 如果篩選完發現沒東西 (可能都過期或重複了)
+					if (validItems.length === 0) {
+						setAlertModalMessage("沒有需要匯入的新資料 (可能項目都已過期，或今天已有相同內容囉！)");
+						setIsAlertModalOpen(true); // 開啟提示 Modal
+						
+						setIsImportPreviousConfirmOpen(false); // 關閉原本的詢問 Modal
+						setImportPreviousData(null);
+						return;
+					}
+
+					// 4. 準備寫入資料
+					const newItems = validItems.map(e => ({ 
+						date: selectedDate, 
+						subject: e.subject, 
+						type: e.type, 
+						content: e.content, 
+						deadline: e.deadline, 
+						repeat: e.repeat 
+					}));
+
+					// 5. 執行儲存
+					saveToCloud('batch_add', newItems, 'entries'); 
+					
+					// 成功後的收尾
+					setIsImportPreviousConfirmOpen(false); 
+					setImportPreviousData(null);
+				}
+			};
             const onRemoveDuplicatesClick = () => setIsRemoveDupConfirmOpen(true);
             const executeRemoveDuplicates = () => {
                 const uniqueSet = new Set(); const idsToDelete = [];
@@ -1701,9 +1796,12 @@
                         )}
 						{/* 4. 交辦幹部 (Cadre) */}
 						{viewMode === 'cadre' && (
-							<CadreTaskSection isTeacherMode={mode === 'teacher'} db={db} />
-						)}						
-				
+							<CadreTaskSection 
+								isTeacherMode={mode === 'teacher'} 
+								db={db} 
+								tasks={cadreTasks}  
+							/>
+						)}
                     </main>
 
                     {/* Modals */}
@@ -1817,7 +1915,7 @@
                                 <button onClick={handleImportClick} className="flex items-center justify-center gap-2 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition-colors">
                                     <Upload className="w-4 h-4"/> 匯入資料
                                 </button>
-                                <button onClick={handleExport} className="flex items-center justify-center gap-2 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition-colors">
+                                <button onClick={handleFullExport} className="flex items-center justify-center gap-2 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition-colors">
                                     <Download className="w-4 h-4"/> 備份資料
                                 </button>
                             </div>
@@ -1863,6 +1961,28 @@
                     <Modal isOpen={isImportPreviousConfirmOpen} onClose={() => setIsImportPreviousConfirmOpen(false)} title="匯入確認" footer={<><button onClick={() => setIsImportPreviousConfirmOpen(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg font-bold">取消</button><button onClick={confirmImportPrevious} className="px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold shadow-md">確認匯入</button></>}>
                          <div className="flex flex-col items-center text-center p-4"><div className="bg-emerald-50 p-4 rounded-full mb-4"><History className="w-10 h-10 text-emerald-500" /></div><h4 className="text-xl font-bold text-slate-800 mb-2">匯入前次內容</h4><p className="text-slate-500">將會匯入前一天的內容到今日。</p></div>
                     </Modal>
+					
+					<Modal isOpen={isAlertModalOpen} Close={() => setIsAlertModalOpen(false)} 
+						title="系統提示" 
+						footer={
+							<button 
+								onClick={() => setIsAlertModalOpen(false)} 
+								className="w-full py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-lg font-bold shadow-md transition-colors"
+							>
+								我知道了
+							</button>
+						}
+					>
+						<div className="flex flex-col items-center text-center p-4">
+							<div className="bg-amber-50 p-4 rounded-full mb-4">
+								{/* 注意：如果你發現 AlertCircle 沒出現，可以改成 AlertTriangle */}
+								<AlertTriangle className="w-10 h-10 text-amber-500" />
+							</div>
+							<p className="text-slate-600 font-bold">
+								{alertModalMessage}
+							</p>
+						</div>
+					</Modal>										
                 </div>
             );
         }
